@@ -1,0 +1,62 @@
+# Package manifest — amalgame-messaging-nats
+#
+# NATS Core client for Amalgame — speaks the wire protocol directly
+# over TCP. NATS Core is the simplest pub/sub broker in the CNCF
+# stable (text protocol, 15 verbs total). No vendored client lib;
+# the protocol fits in ~500 LoC of C using the same socket layer
+# `amalgame-messaging-mqtt` reuses.
+#
+# Surface (v1):
+#   Open / Close / IsOpen / LastError                lifecycle + diag
+#   Ping                                              PING → PONG
+#   Publish(subject, payload)                         PUB
+#   Subscribe(subject)                                SUB (single sid)
+#   Unsubscribe(subject)                              UNSUB
+#   WaitMessage(timeout_ms) / LastSubject /
+#     LastPayload / LastReplyTo                       MSG recv loop
+#
+# Out of scope (v2):
+#   - Request/Reply helpers (caller builds the reply-to subject
+#     and subscribes manually for now)
+#   - Multiple concurrent subscriptions tracked by sid
+#   - Queue groups (`SUB <subj> <queue> <sid>`)
+#   - JetStream (KV / Object store / streams) — separate package
+#   - TLS (nats:// → nats+tls://)
+#   - Username / password / NKEY / JWT / token auth
+#   - Cluster discovery / failover from INFO `connect_urls`
+#   - Binary payloads (uses code_string today; payloads with
+#     embedded NULs would truncate)
+#
+# Installation:
+#
+#   amc package add nats                              # via curated index
+#   amc package add github.com/amalgame-lang/amalgame-messaging-nats@v0.1.0
+
+[package]
+name              = "amalgame-messaging-nats"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "NATS Core client for Amalgame — pure-protocol over raw TCP, no vendored lib."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.5.0"
+
+[stdlib]
+class     = "NATS"
+header    = "runtime/Amalgame_Messaging_NATS.h"
+namespace = "Amalgame.Messaging.NATS"
+
+[stdlib.functions]
+Open         = { returns = "AmalgameNATS*" }
+Close        = { returns = "void" }
+IsOpen       = { returns = "code_bool" }
+LastError    = { returns = "code_string" }
+Ping         = { returns = "code_bool" }
+Publish      = { returns = "code_bool" }
+Subscribe    = { returns = "code_bool" }
+Unsubscribe  = { returns = "code_bool" }
+WaitMessage  = { returns = "code_bool" }
+LastSubject  = { returns = "code_string" }
+LastPayload  = { returns = "code_string" }
+LastReplyTo  = { returns = "code_string" }
+
+[dependencies]

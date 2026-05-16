@@ -1,0 +1,133 @@
+// Stdlib test: Amalgame.Messaging.NATS — NATS Core client speaking
+// the wire protocol over a raw TCP socket. Assumes a NATS server
+// listening on 127.0.0.1:4222 (default port). The test runner gates
+// this fixture on TCP reachability; if no server is up, every case
+// SKIPs cleanly.
+//
+// To run locally:
+//   docker run --rm -p 4222:4222 nats:2-alpine
+//   # or
+//   brew install nats-server && nats-server &
+//
+// All subjects are namespaced under `amctest.` to keep the test
+// isolated from any production traffic on a shared server.
+
+namespace Tests
+
+import Amalgame.Messaging.NATS
+
+public class Program {
+    public static void Main(string[] args) {
+
+        // ── Open + INFO handshake + CONNECT ───────────────
+
+        let n = NATS.Open("127.0.0.1", 4222)
+        if (NATS.IsOpen(n)) {
+            Console.WriteLine("[PASS] open 4222")
+        } else {
+            Console.WriteLine("[FAIL] open 4222: " + NATS.LastError(n))
+            return
+        }
+
+        // ── PING → PONG round-trip ────────────────────────
+
+        let pingOk: bool = NATS.Ping(n)
+        if (pingOk) {
+            Console.WriteLine("[PASS] ping")
+        } else {
+            Console.WriteLine("[FAIL] ping: " + NATS.LastError(n))
+        }
+
+        // ── SUBSCRIBE ─────────────────────────────────────
+
+        let subOk: bool = NATS.Subscribe(n, "amctest.greeting")
+        if (subOk) {
+            Console.WriteLine("[PASS] subscribe greeting")
+        } else {
+            Console.WriteLine("[FAIL] subscribe greeting: " + NATS.LastError(n))
+        }
+
+        // ── PUBLISH → loopback delivery ───────────────────
+
+        // Publish to the same subject we just subscribed to. The
+        // server echoes the message back to us; WaitMessage with a
+        // 2s budget should receive it well before timing out.
+        let pubOk: bool = NATS.Publish(n, "amctest.greeting", "hello nats")
+        if (pubOk) {
+            Console.WriteLine("[PASS] publish greeting")
+        } else {
+            Console.WriteLine("[FAIL] publish greeting: " + NATS.LastError(n))
+        }
+
+        let got: bool = NATS.WaitMessage(n, 2000)
+        if (got) {
+            Console.WriteLine("[PASS] received message")
+        } else {
+            Console.WriteLine("[FAIL] wait timed out: " + NATS.LastError(n))
+        }
+
+        let subject: string = NATS.LastSubject(n)
+        if (subject == "amctest.greeting") {
+            Console.WriteLine("[PASS] subject matches")
+        } else {
+            Console.WriteLine("[FAIL] subject got '" + subject + "'")
+        }
+
+        let payload: string = NATS.LastPayload(n)
+        if (payload == "hello nats") {
+            Console.WriteLine("[PASS] payload matches")
+        } else {
+            Console.WriteLine("[FAIL] payload got '" + payload + "'")
+        }
+
+        // ── Wildcard subscription ─────────────────────────
+
+        // The first subscription is still active (single-sub model in
+        // v1 — re-Subscribe replaces it). Switch to a wildcard pattern
+        // and verify it matches a multi-token subject.
+        NATS.Unsubscribe(n, "amctest.greeting")
+        NATS.Subscribe(n, "amctest.wild.>")
+
+        NATS.Publish(n, "amctest.wild.foo.bar", "wildcard hit")
+        let gotWild: bool = NATS.WaitMessage(n, 2000)
+        if (gotWild && NATS.LastSubject(n) == "amctest.wild.foo.bar"
+                    && NATS.LastPayload(n) == "wildcard hit") {
+            Console.WriteLine("[PASS] wildcard subscription")
+        } else {
+            Console.WriteLine("[FAIL] wildcard got subj='" + NATS.LastSubject(n) +
+                              "' payload='" + NATS.LastPayload(n) + "'")
+        }
+
+        // ── Second round-trip on the same wildcard sub ────
+
+        NATS.Publish(n, "amctest.wild.zzz", "round two")
+        let got2: bool = NATS.WaitMessage(n, 2000)
+        if (got2 && NATS.LastPayload(n) == "round two") {
+            Console.WriteLine("[PASS] second message")
+        } else {
+            Console.WriteLine("[FAIL] second message got '" + NATS.LastPayload(n) + "'")
+        }
+
+        // ── Timeout path ──────────────────────────────────
+
+        // No publisher on this subject — WaitMessage should time out
+        // and return false within ~500ms.
+        NATS.Unsubscribe(n, "amctest.wild.>")
+        NATS.Subscribe(n, "amctest.silence")
+        let timeoutHit: bool = NATS.WaitMessage(n, 500)
+        if (!timeoutHit) {
+            Console.WriteLine("[PASS] wait timeout")
+        } else {
+            Console.WriteLine("[FAIL] wait should have timed out")
+        }
+
+        // ── Close ─────────────────────────────────────────
+
+        NATS.Close(n)
+        if (!NATS.IsOpen(n)) {
+            Console.WriteLine("[PASS] closed")
+        } else {
+            Console.WriteLine("[FAIL] still open after close")
+        }
+    }
+}
