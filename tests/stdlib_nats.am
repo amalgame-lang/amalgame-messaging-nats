@@ -90,8 +90,12 @@ public class Program {
 
         NATS.Publish(n, "amctest.wild.foo.bar", "wildcard hit")
         let gotWild: bool = NATS.WaitMessage(n, 2000)
-        if (gotWild && NATS.LastSubject(n) == "amctest.wild.foo.bar"
-                    && NATS.LastPayload(n) == "wildcard hit") {
+        // NB: amc's parser doesn't continue `&&` across newlines
+        // (only `+-*/%` got that fix in v0.8.14), so we fold the
+        // multi-condition check via intermediate bools.
+        let subjOk: bool = NATS.LastSubject(n) == "amctest.wild.foo.bar"
+        let payOk: bool = NATS.LastPayload(n) == "wildcard hit"
+        if (gotWild && subjOk && payOk) {
             Console.WriteLine("[PASS] wildcard subscription")
         } else {
             Console.WriteLine("[FAIL] wildcard got subj='" + NATS.LastSubject(n) +
