@@ -6,20 +6,22 @@
 # the protocol fits in ~500 LoC of C using the same socket layer
 # `amalgame-messaging-mqtt` reuses.
 #
-# Surface (v1):
+# Surface (v2):
 #   Open / Close / IsOpen / LastError                lifecycle + diag
 #   Ping                                              PING → PONG
 #   Publish(subject, payload)                         PUB
+#   PublishWithReply(subject, replyTo, payload)       PUB with reply-to (v0.2)
 #   Subscribe(subject)                                SUB (single sid)
+#   SubscribeQueue(subject, queue)                    SUB with queue group (v0.2)
 #   Unsubscribe(subject)                              UNSUB
 #   WaitMessage(timeout_ms) / LastSubject /
 #     LastPayload / LastReplyTo                       MSG recv loop
+#   Request(subject, payload, timeout_ms)             synchronous
+#                                                     request/reply (v0.2)
 #
-# Out of scope (v2):
-#   - Request/Reply helpers (caller builds the reply-to subject
-#     and subscribes manually for now)
-#   - Multiple concurrent subscriptions tracked by sid
-#   - Queue groups (`SUB <subj> <queue> <sid>`)
+# Out of scope (v3):
+#   - Multiple concurrent user-side subscriptions tracked by sid
+#     (only Request creates a dedicated sid internally)
 #   - JetStream (KV / Object store / streams) — separate package
 #   - TLS (nats:// → nats+tls://)
 #   - Username / password / NKEY / JWT / token auth
@@ -30,15 +32,15 @@
 # Installation:
 #
 #   amc package add nats                              # via curated index
-#   amc package add github.com/amalgame-lang/amalgame-messaging-nats@v0.1.0
+#   amc package add github.com/amalgame-lang/amalgame-messaging-nats@v0.2.0
 
 [package]
 name              = "amalgame-messaging-nats"
-version           = "0.1.0"
+version           = "0.2.0"
 license           = "Apache-2.0"
-description       = "NATS Core client for Amalgame — pure-protocol over raw TCP, no vendored lib."
+description       = "NATS Core client for Amalgame — pure-protocol over raw TCP, no vendored lib. v0.2 adds Request/Reply + queue groups."
 authors           = ["Bastien Mouget"]
-required-amalgame = ">=0.5.0"
+required-amalgame = ">=0.8.19"
 
 [stdlib]
 class     = "NATS"
@@ -46,17 +48,20 @@ header    = "runtime/Amalgame_Messaging_NATS.h"
 namespace = "Amalgame.Messaging.NATS"
 
 [stdlib.functions]
-Open         = { returns = "AmalgameNATS*" }
-Close        = { returns = "void" }
-IsOpen       = { returns = "code_bool" }
-LastError    = { returns = "code_string" }
-Ping         = { returns = "code_bool" }
-Publish      = { returns = "code_bool" }
-Subscribe    = { returns = "code_bool" }
-Unsubscribe  = { returns = "code_bool" }
-WaitMessage  = { returns = "code_bool" }
-LastSubject  = { returns = "code_string" }
-LastPayload  = { returns = "code_string" }
-LastReplyTo  = { returns = "code_string" }
+Open             = { returns = "AmalgameNATS*" }
+Close            = { returns = "void" }
+IsOpen           = { returns = "code_bool" }
+LastError        = { returns = "code_string" }
+Ping             = { returns = "code_bool" }
+Publish          = { returns = "code_bool" }
+PublishWithReply = { returns = "code_bool" }
+Subscribe        = { returns = "code_bool" }
+SubscribeQueue   = { returns = "code_bool" }
+Unsubscribe      = { returns = "code_bool" }
+WaitMessage      = { returns = "code_bool" }
+LastSubject      = { returns = "code_string" }
+LastPayload      = { returns = "code_string" }
+LastReplyTo      = { returns = "code_string" }
+Request          = { returns = "code_string" }
 
 [dependencies]
