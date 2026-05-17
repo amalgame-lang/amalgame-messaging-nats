@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test against amc ${{ matrix.amc-tag }}
+    runs-on: ubuntu-latest
+
+    # GitHub Actions service container — official nats:2-alpine
+    # image. Health-check uses the NATS HTTP monitoring endpoint
+    # which the default config exposes on port 8222.
+    services:
+      nats:
+        image: nats:2-alpine
+        ports: ['4222:4222', '8222:8222']
+        # nats:2 runs `-m 8222` for HTTP monitoring; healthcheck
+        # via wget keeps the image footprint small (no curl).
+        options: >-
+          --health-cmd "wget -qO- http://127.0.0.1:8222/healthz || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # v0.8.19+ required (cgen + LSP fixes from the postgresql
+        # session). Append tags as amc cuts meaningfully relevant
+        # releases.
+        amc-tag: [v0.8.20]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (libgc + libcurl)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgc-dev libcurl4-openssl-dev
+
+      - name: Download amc ${{ matrix.amc-tag }}
+        run: |
+          set -e
+          TAG="${{ matrix.amc-tag }}"
+          VERSION="${TAG#v}"
+          curl -sSL -o amc.tar.gz \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
+          mkdir -p $RUNNER_TEMP/amc-install
+          tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
+          echo "AMC=$RUNNER_TEMP/amc-install/bin/amc" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/share/amalgame/runtime" >> $GITHUB_ENV
+
+      - name: Probe nats reachability
+        run: |
+          if (echo > /dev/tcp/127.0.0.1/4222) 2>/dev/null; then
+            echo "  nats: reachable at 127.0.0.1:4222"
+          else
+            echo "  nats: NOT reachable — service container not healthy?"
+            exit 1
+          fi
+
+      - name: Run end-to-end tests
+        run: |
+          chmod +x ./tests/run_tests.sh
+          ./tests/run_tests.sh "$AMC"

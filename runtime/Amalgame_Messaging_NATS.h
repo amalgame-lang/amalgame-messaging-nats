@@ -387,23 +387,35 @@ static inline code_bool Amalgame_Messaging_NATS_Ping(AmalgameNATS* n) {
 
 /* ── Publish ────────────────────────────────────────── */
 
-/* Build and send `PUB <subject> <bytes>\r\n<payload>\r\n`. NATS
- * subjects can't contain spaces or CRLF; the caller is trusted —
- * passing an invalid subject surfaces as a server -ERR on the
- * next WaitMessage, not as a synchronous error here. */
-static inline code_bool Amalgame_Messaging_NATS_Publish(AmalgameNATS* n,
-                                                          code_string subject,
-                                                          code_string payload) {
+/* Internal: PUB write — common path for Publish and
+ * PublishWithReply. replyTo may be NULL or "" (omit the field).
+ * NATS subjects can't contain spaces or CRLF; the caller is
+ * trusted — passing an invalid subject surfaces as a server
+ * -ERR on the next WaitMessage, not as a synchronous error
+ * here. */
+static inline code_bool _amnats_pub_internal(AmalgameNATS* n,
+                                              const char* subject,
+                                              const char* replyTo,
+                                              const char* payload) {
     if (!n || n->fd < 0 || !subject) return 0;
-    if (!payload) payload = (code_string) "";
+    if (!payload) payload = "";
 
     size_t slen = strlen(subject);
     size_t plen = strlen(payload);
+    int has_reply = (replyTo && *replyTo) ? 1 : 0;
+    size_t rlen = has_reply ? strlen(replyTo) : 0;
 
-    /* Header: "PUB " + subject + " " + plen + "\r\n" */
-    char header[256];
-    int hn = snprintf(header, sizeof(header), "PUB %.*s %zu\r\n",
+    /* Header: "PUB " + subject [+ " " + replyTo] + " " + plen + "\r\n" */
+    char header[512];
+    int hn;
+    if (has_reply) {
+        hn = snprintf(header, sizeof(header), "PUB %.*s %.*s %zu\r\n",
+                       (int)(slen > 200 ? 200 : slen), subject,
+                       (int)(rlen > 200 ? 200 : rlen), replyTo, plen);
+    } else {
+        hn = snprintf(header, sizeof(header), "PUB %.*s %zu\r\n",
                        (int)(slen > 200 ? 200 : slen), subject, plen);
+    }
     if (hn <= 0 || (size_t) hn >= sizeof(header)) {
         n->last_error = _amnats_err_dup("PUB header too long (subject?)");
         return 0;
@@ -421,6 +433,23 @@ static inline code_bool Amalgame_Messaging_NATS_Publish(AmalgameNATS* n,
         return 0;
     }
     return 1;
+}
+
+/* Publish without reply-to (v1 surface). */
+static inline code_bool Amalgame_Messaging_NATS_Publish(AmalgameNATS* n,
+                                                          code_string subject,
+                                                          code_string payload) {
+    return _amnats_pub_internal(n, subject, NULL, payload);
+}
+
+/* PUB with explicit reply-to — receiver sees the inbox in
+ * LastReplyTo() and can publish a response back. Added in v0.2
+ * so Request/Reply patterns can be hand-rolled too, not just
+ * via the all-in-one Request helper. */
+static inline code_bool Amalgame_Messaging_NATS_PublishWithReply(
+        AmalgameNATS* n, code_string subject, code_string replyTo,
+        code_string payload) {
+    return _amnats_pub_internal(n, subject, replyTo, payload);
 }
 
 /* ── Subscribe / Unsubscribe ────────────────────────── */
@@ -441,6 +470,32 @@ static inline code_bool Amalgame_Messaging_NATS_Subscribe(AmalgameNATS* n,
     }
     if (_amnats_send_all(n->fd, (const unsigned char*) buf, (size_t) len) < 0) {
         n->last_error = _amnats_err_dup("SUB send failed");
+        return 0;
+    }
+    n->active_sid = sid;
+    return 1;
+}
+
+/* SUB <subject> <queue> <sid>\r\n. Multiple subscribers with the
+ * same `queue` name form a queue group: the server load-balances
+ * incoming messages across them (each message goes to exactly one
+ * member of the group, round-robin style). Added in v0.2. */
+static inline code_bool Amalgame_Messaging_NATS_SubscribeQueue(
+        AmalgameNATS* n, code_string subject, code_string queue) {
+    if (!n || n->fd < 0 || !subject || !queue) return 0;
+    int sid = n->next_sid++;
+    char buf[384];
+    int len = snprintf(buf, sizeof(buf), "SUB %.*s %.*s %d\r\n",
+                       (int) (strlen(subject) > 200 ? 200 : strlen(subject)),
+                       subject,
+                       (int) (strlen(queue) > 100 ? 100 : strlen(queue)),
+                       queue, sid);
+    if (len <= 0 || (size_t) len >= sizeof(buf)) {
+        n->last_error = _amnats_err_dup("SUB (queue) header too long");
+        return 0;
+    }
+    if (_amnats_send_all(n->fd, (const unsigned char*) buf, (size_t) len) < 0) {
+        n->last_error = _amnats_err_dup("SUB (queue) send failed");
         return 0;
     }
     n->active_sid = sid;
@@ -584,6 +639,89 @@ static inline code_string Amalgame_Messaging_NATS_LastPayload(AmalgameNATS* n) {
 static inline code_string Amalgame_Messaging_NATS_LastReplyTo(AmalgameNATS* n) {
     if (!n || !n->last_reply_to) return (code_string) "";
     return n->last_reply_to;
+}
+
+/* ── Request / Reply (v0.2) ─────────────────────────── */
+
+/* Synchronous request/reply pattern over NATS Core. Orchestrates:
+ *   1. Generate a unique inbox name `_INBOX.<pid>.<counter>`.
+ *   2. Send SUB <inbox> <sid> on a dedicated sid (doesn't touch
+ *      the handle's active_sid; user subscriptions stay intact).
+ *   3. PUB <subject> <inbox> <bytes> with the request payload.
+ *   4. Wait up to timeout_ms for the first MSG on this sid.
+ *   5. UNSUB <sid> regardless of outcome.
+ *
+ * Returns the response payload, or "" on timeout / error. Sets
+ * last_subject / last_reply_to / last_payload on the handle for
+ * the matching reply (mirrors WaitMessage's contract).
+ *
+ * Note: this uses a dedicated process-monotonic counter for the
+ * inbox + sid so concurrent Request calls on the same handle
+ * don't collide. Concurrent Request from different threads
+ * against the same handle are still unsafe — the wire is
+ * shared. Use separate handles per thread.
+ */
+#include <unistd.h>     /* getpid */
+
+static int _amnats_req_counter = 0;
+
+static inline code_string Amalgame_Messaging_NATS_Request(
+        AmalgameNATS* n, code_string subject, code_string payload,
+        i64 timeout_ms) {
+    if (!n || n->fd < 0 || !subject) return (code_string) "";
+    if (!payload) payload = (code_string) "";
+
+    /* Generate unique inbox + sid for THIS request. */
+    int req_id = ++_amnats_req_counter;
+    int sid    = 1000000 + req_id;   /* high range, no collision with active_sid */
+    char inbox[64];
+    snprintf(inbox, sizeof(inbox), "_INBOX.%d.%d", (int) getpid(), req_id);
+
+    /* SUB inbox sid */
+    char sub_buf[128];
+    int sub_len = snprintf(sub_buf, sizeof(sub_buf), "SUB %s %d\r\n", inbox, sid);
+    if (_amnats_send_all(n->fd, (const unsigned char*) sub_buf, (size_t) sub_len) < 0) {
+        n->last_error = _amnats_err_dup("Request: SUB inbox send failed");
+        return (code_string) "";
+    }
+
+    /* PUB subject inbox payload */
+    if (!_amnats_pub_internal(n, subject, inbox, payload)) {
+        /* Pub failed; try to clean up sub. */
+        char un[32];
+        int un_len = snprintf(un, sizeof(un), "UNSUB %d\r\n", sid);
+        (void) _amnats_send_all(n->fd, (const unsigned char*) un, (size_t) un_len);
+        return (code_string) "";
+    }
+
+    /* Wait for reply. Reuse WaitMessage's drain loop with the
+     * caller's timeout. The first MSG that lands ends up in
+     * n->last_*; we don't filter by sid (the inbox is unique
+     * enough that any unrelated server-side traffic is ignored
+     * — non-MSG lines are drained transparently by WaitMessage). */
+    code_bool got = Amalgame_Messaging_NATS_WaitMessage(n, timeout_ms);
+
+    /* UNSUB regardless of outcome. */
+    char un_buf[32];
+    int un_len = snprintf(un_buf, sizeof(un_buf), "UNSUB %d\r\n", sid);
+    (void) _amnats_send_all(n->fd, (const unsigned char*) un_buf, (size_t) un_len);
+
+    if (!got) {
+        /* Timeout — leave last_error empty (timeout isn't an error). */
+        return (code_string) "";
+    }
+
+    /* Sanity check: returned MSG should have come on our inbox.
+     * If not, treat as missed (shouldn't happen — UNSUB is best-
+     * effort, server may still deliver a couple more, but
+     * different sid means different sub). */
+    if (n->last_subject && strcmp(n->last_subject, inbox) != 0) {
+        /* Different subject — wasn't our reply. Caller still sees
+         * it via last_*; we just return empty so they know
+         * Request didn't get its expected response. */
+        return (code_string) "";
+    }
+    return n->last_payload ? n->last_payload : (code_string) "";
 }
 
 #endif /* AMALGAME_MESSAGING_NATS_H */
